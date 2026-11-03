@@ -5,13 +5,15 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Build kernel ptx
-    const nvcc_compile = b.addSystemCommand(&.{"nvcc", "-ptx", "-arch=native", "src/kernels.cu", "-o"});
+    const nvcc_compile = b.addSystemCommand(&.{"nvcc", "-ptx", "-lineinfo", "-arch=native", "src/kernels.cu", "-o"});
     nvcc_compile.addFileInput(b.path("src/kernels.cu"));
     const nvcc_output = nvcc_compile.addOutputFileArg2("kernels.ptx", .{});
 
-    // Copy ptx to zig-out for debugging
-    const install_ptx = b.addInstallFile(nvcc_output, "kernels.ptx");
-    b.getInstallStep().dependOn(&install_ptx.step);
+    if (optimize == .debug) {
+        // Copy ptx to zig-out for debugging
+        const install_ptx = b.addInstallFile(nvcc_output, "kernels.ptx");
+        b.getInstallStep().dependOn(&install_ptx.step);
+    }
 
     const cuda_translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/cuda.h"),
