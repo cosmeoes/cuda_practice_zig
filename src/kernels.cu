@@ -34,3 +34,23 @@ extern "C" __global__ void saxpy4(float a, const float* __restrict__ x, float* _
         y[i] = a * x[i] + y[i];
     }
 }
+
+extern "C" __global__ void matadd_coalesced(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c, unsigned rows, unsigned columns) {
+    const int row = threadIdx.y + blockIdx.y * blockDim.y;
+    const int column = threadIdx.x + blockIdx.x * blockDim.x;
+    const int i = row * columns + column;
+
+    if (column < columns && row < rows) {
+        c[i] = a[i] + b[i];
+    }
+}
+
+extern "C" __global__ void matadd_strided(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c, unsigned rows, unsigned columns) {
+    const int row = threadIdx.x + blockIdx.x * blockDim.x;
+    const int column = threadIdx.y + blockIdx.y * blockDim.y;
+    const int i = row * columns + column;
+
+    if (column < columns && row < rows) {
+        c[i] = a[i] + b[i];
+    }
+}

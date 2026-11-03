@@ -79,6 +79,10 @@ fn DeviceSlice(comptime T: type) type {
             assert(host_slice.len == self.len);
             try check(cuda.cudaMemcpy(host_slice.ptr, self.ptr, self.byteSize(), cuda.cudaMemcpyDeviceToHost));
         }
+
+        pub fn memset(self: @This(), value: i32) !void {
+            try check(cuda.cudaMemset(self.ptr, value, self.byteSize()));
+        }
     };
 }
 
@@ -138,9 +142,10 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     var gpu: GPU = try .init(arena);
-    try unified_memory_example(io, gpu, 1024);
-    try explicit_mem_example(io, &gpu, 1024);
-    try saxpy_grid_stride_problem(io, &gpu);
+    // try unified_memory_example(io, gpu, 1024);
+    // try explicit_mem_example(io, &gpu, 1024);
+    // try saxpy_grid_stride_problem(io, &gpu);
+    try matadd_problem(io, &gpu);
 }
 
 fn check(r: cuda.cudaError_t) !void {
@@ -392,6 +397,139 @@ pub fn saxpy_grid_stride_problem(io: std.Io, gpu: *GPU) !void {
         if (@abs(expected - out[i]) > 0.00001) {
             std.debug.print("Index {} of {} mismatch: {} != {}\n", .{i, out.len, expected, out[i]});
             return error.ValuesDontMatch;
+        }
+    }
+
+    std.debug.print("Results match!", .{});
+}
+
+// Compute C = A + B for a row-major 3001 × 4099 float matrix, using 2D blocks of (32, 8). Write two kernels:
+// - coalesced: the x dimension (threadIdx.x / blockIdx.x) walks columns.
+// - strided: the x dimension walks rows.
+// 
+// Use one thread per element: every element of the matrix gets exactly one thread, with no grid-stride loop. 
+// Choosing each kernel's grid size is part of the exercise, and it depends on which matrix dimension that kernel maps to x. Guard against out-of-range indices.
+// Measure: the bandwidth of both. Explain the gap in terms of how the 32 lanes of one warp map to memory addresses.
+// Stretch: in Nsight Compute, compare "sectors per request" between the two kernels.
+pub fn matadd_problem(io: std.Io, gpu: *GPU) !void {
+    //  Messuraments on my 3070 ti:
+    //    matadd_coalesced took 0.275416 ms (535.9645 GB/s)
+    //    matadd_strided took 0.8248416 ms (178.95943 GB/s)
+    // The thread blocks have a width of 32 so that means that each row of the thread blocks corresponds
+    // to a warp. In the matadd_coalesced the reads/writes are sequencial within each warp.
+    // t1 reads/writes offset i, t2 reads/writes offset i+1, t3 reads/writes offset i+2 .. t32 reads/writes offset i+31
+    // So for each read/write (a and b are read and c is written) the warp reads/writes 128 bytes
+    // which can be executed in 4 transactions (best case scenario, worse is 5) since it only touches 4 sections in global memory (sections are 32 bytes).
+    // In the metadd_strided the access patter looks more like:
+    // t1 reads/writes offset i, t2 reads/writes offset i + columns, t3 reads/writes offset i + columns*2 .. t32 reads/writes offset i + columns*31
+    // Since the reads are no sequencial each read/write touches a different section which requires 32 transactions and it fetches 1024 bytes and 
+    // only uses the same 128 bytes which increases memory traffic unnecessarily. (Although cache helps)
+
+    var hostArena = std.heap.ArenaAllocator.init(gpu.host_allocator.allocator());
+    defer _ = hostArena.deinit();
+    var hostAlloc = hostArena.allocator();
+
+    var rows: u32 = 3001;
+    var cols: u32 = 4099;
+    const size = rows*cols;
+
+    const hostBuffer = try hostAlloc.alloc(f32, size*3);
+    const a = hostBuffer[0..size];
+    const b = hostBuffer[size..size*2];
+    const c = hostBuffer[size*2..hostBuffer.len];
+
+    var prng = std.Random.DefaultPrng.init(@intCast(std.Io.Clock.real.now(io).toMicroseconds()));
+    const random = prng.random();
+    init_array(random, a);
+    init_array(random, b);
+
+    const deviceBuffer = try gpu.malloc(f32, rows*cols * 3);
+    defer gpu.free(deviceBuffer.ptr);
+    var devA = deviceBuffer.sub(0, rows*cols);
+    var devB = deviceBuffer.sub(rows*cols, rows*cols*2);
+    var devC = deviceBuffer.sub(rows*cols*2, deviceBuffer.len);
+
+    try devA.copyFromHost(a);
+    try devB.copyFromHost(b);
+
+    // Timing events
+    const sampleSize = 20;
+    var start: cuda.cudaEvent_t = undefined;
+    var end: cuda.cudaEvent_t = undefined;
+    try check(cuda.cudaEventCreate(&start));
+    defer _ = cuda.cudaEventDestroy(start);
+    try check(cuda.cudaEventCreate(&end));
+    defer _ = cuda.cudaEventDestroy(end);
+
+    var params = [_]?*anyopaque{@ptrCast(&devA.ptr), @ptrCast(&devB.ptr), @ptrCast(&devC.ptr), &rows, &cols};
+    // matadd_coallesced
+    {
+        const matadd_coalesced = gpu.kernels.get("matadd_coalesced").?;
+        const blockDim = dim3(32, 8, 1);
+        const gridDim = dim3(@divCeil(cols, blockDim.x), @divCeil(rows, blockDim.y), 1);
+        var config: cuda.cudaLaunchConfig_t  = .{
+            .gridDim = gridDim,
+            .blockDim = blockDim,
+        };
+        try check(cuda.cudaEventRecord(start, null));
+        for (0..sampleSize) |_| {
+            try check(cuda.cudaLaunchKernelExC(&config, matadd_coalesced, &params));
+        }
+        try check(cuda.cudaEventRecord(end, null));
+        try check(cuda.cudaDeviceSynchronize());
+
+        var timeTaken: f32 = undefined;
+        try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+        timeTaken = timeTaken / sampleSize;
+        // Compute bandwidth (the 3* is for two reads and one write)
+        const bandwidth = calculate_bandwidth(3 * size * @sizeOf(f32), timeTaken);
+        std.debug.print("matadd_coalesced took {} ms ({} GB/s)\n", .{timeTaken, bandwidth});
+
+        // Check correctness 
+        try devC.copyToHost(c);
+        for (0..c.len) |i| {
+            const expected = a[i] + b[i];
+            if (@abs(expected - c[i]) > 0.00001) {
+                std.debug.print("Index {} of {} mismatch: {} != {}\n", .{i, c.len, expected, c[i]});
+                return error.ValuesDontMatch;
+            }
+        }
+    }
+
+    // Reset the output to make sure it doesn't influence the next kernel
+    try devC.memset(0xFF);
+
+    // matadd_strided
+    {
+        const matadd_strided = gpu.kernels.get("matadd_strided").?;
+        const blockDim = dim3(32, 8, 1);
+        const gridDim = dim3(@divCeil(rows, blockDim.x), @divCeil(cols, blockDim.y), 1);
+        var config: cuda.cudaLaunchConfig_t  = .{
+            .gridDim = gridDim,
+            .blockDim = blockDim,
+        };
+        try check(cuda.cudaEventRecord(start, null));
+        for (0..sampleSize) |_| {
+            try check(cuda.cudaLaunchKernelExC(&config, matadd_strided, &params));
+        }
+        try check(cuda.cudaEventRecord(end, null));
+        try check(cuda.cudaDeviceSynchronize());
+
+        var timeTaken: f32 = undefined;
+        try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+        timeTaken = timeTaken / sampleSize;
+        // Compute bandwidth (the 3* is for two reads and one write)
+        const bandwidth = calculate_bandwidth(3 * size * @sizeOf(f32), timeTaken);
+        std.debug.print("matadd_strided took {} ms ({} GB/s)\n", .{timeTaken, bandwidth});
+
+        // Check correctness 
+        try devC.copyToHost(c);
+        for (0..c.len) |i| {
+            const expected = a[i] + b[i];
+            if (@abs(expected - c[i]) > 0.00001) {
+                std.debug.print("Index {} of {} mismatch: {} != {}\n", .{i, c.len, expected, c[i]});
+                return error.ValuesDontMatch;
+            }
         }
     }
 
