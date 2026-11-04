@@ -145,7 +145,8 @@ pub fn main(init: std.process.Init) !void {
     // try unified_memory_example(io, gpu, 1024);
     // try explicit_mem_example(io, &gpu, 1024);
     // try saxpy_grid_stride_problem(io, &gpu);
-    try matadd_problem(io, &gpu);
+    // try matadd_problem(io, &gpu);
+    try warp_divergence_problem(io, &gpu);
 }
 
 fn check(r: cuda.cudaError_t) !void {
@@ -167,6 +168,18 @@ fn checkdrv(r: cuda.CUresult) !void {
 
 pub fn dim3(x: c_uint, y: c_uint, z: c_uint) cuda.dim3 {
     return  .{ .x = x, .y = y, .z = z};
+}
+
+// Bandwidth in gbs/s
+fn calculate_bandwidth(bytes: usize, ms: f32) f32 {
+    const bytesf: f32 = @floatFromInt(bytes);
+    return (bytesf/1e9) / (ms/1000);
+}
+
+fn init_array(random: std.Random,  a: []f32) void {
+    for (a) |*x| {
+        x.* = random.float(f32);
+    }
 }
 
 pub fn unified_memory_example(io: std.Io, gpu: GPU, vectorLength: c_uint) !void {
@@ -250,12 +263,6 @@ pub fn explicit_mem_example(io: std.Io, gpu: *GPU, vectorLength: c_uint) !void {
         }
     }
     std.debug.print("Results match!\n", .{});
-}
-
-fn init_array(random: std.Random,  a: []f32) void {
-    for (a) |*x| {
-        x.* = random.float(f32);
-    }
 }
 
 // Problem statement:
@@ -536,9 +543,138 @@ pub fn matadd_problem(io: std.Io, gpu: *GPU) !void {
     std.debug.print("Results match!", .{});
 }
 
-// Bandwidth in gbs/s
-fn calculate_bandwidth(bytes: usize, ms: f32) f32 {
-    const bytesf: f32 = @floatFromInt(bytes);
-    return (bytesf/1e9) / (ms/1000);
-}
+// Two expensive pure functions on uint32_t (each runs 512 iterations):
+//    __host__ __device__ uint32_t work_a(uint32_t v){ for(int k=0;k<512;++k){v^=v<<13;v^=v>>17;v^=v<<5;} return v; }
+//    __host__ __device__ uint32_t work_b(uint32_t v){ for(int k=0;k<512;++k) v=v*1664525u+1013904223u; return v; }
+// The baseline kernel computes out[i] = (i % 2 == 0) ? work_a(in[i]) : work_b(in[i]), with one thread per element.
+// Task: write the baseline, then write a second kernel that produces bit-identical output where every branch is uniform across each warp. Leave the per-element work alone; change which thread handles which element.
+// Launch configuration, the same for both kernels: n = 2^22, blocks of 256 threads, one thread per element. Block b owns elements [256·b, 256·b + 256). 
+// In the second kernel, a block can reassign the elements of its own chunk among its threads however it likes, but it can't touch elements outside its chunk.
+// Measure: the speed-up (expect about 2×).
+// Stretch: change the baseline's condition to i % 64 < 32 and predict the timing before you run it.
+pub fn warp_divergence_problem(io: std.Io, gpu: *GPU) !void {
+    var hostArena = std.heap.ArenaAllocator.init(gpu.host_allocator.allocator());
+    defer _ = hostArena.deinit();
+    var hostAlloc = hostArena.allocator();
 
+    var n: u32 = std.math.pow(u32, 2, 22);
+
+    const hostBuffer = try hostAlloc.alloc(u32, n*2);
+    const in = hostBuffer[0..n];
+    const out = hostBuffer[n..hostBuffer.len];
+
+    var prng = std.Random.DefaultPrng.init(@intCast(std.Io.Clock.real.now(io).toMicroseconds()));
+    const random = prng.random();
+    for (in) |*x| {
+        x.* = random.int(u32);
+    }
+
+    const deviceBuffer = try gpu.malloc(u32, n*2);
+    defer gpu.free(deviceBuffer.ptr);
+    var devIn = deviceBuffer.sub(0, n);
+    var devOut = deviceBuffer.sub(n, deviceBuffer.len);
+
+    try devIn.copyFromHost(in);
+
+    // Timing events
+    const sampleSize = 20;
+    var start: cuda.cudaEvent_t = undefined;
+    var end: cuda.cudaEvent_t = undefined;
+    try check(cuda.cudaEventCreate(&start));
+    defer _ = cuda.cudaEventDestroy(start);
+    try check(cuda.cudaEventCreate(&end));
+    defer _ = cuda.cudaEventDestroy(end);
+
+    var params = [_]?*anyopaque{@ptrCast(&devIn.ptr), @ptrCast(&devOut.ptr), &n};
+    var config: cuda.cudaLaunchConfig_t  = .{
+        .gridDim = dim3(@divCeil(n, 256), 1, 1),
+        .blockDim = dim3(256, 1, 1),
+    };
+
+    const f = struct {
+        fn work_a(v_in: u32) u32 {
+            var v = v_in;
+            var k: u32 = 0;
+            while (k < 512) : (k+=1) {
+                v ^= v<<13;
+                v ^= v>>17;
+                v ^= v<<5;
+            }
+            return v;
+        }
+
+        fn work_b(v_in: u32) u32 {
+            var v = v_in;
+            var k: u32 = 0;
+            while (k < 512) : (k+=1) {
+                v = v *% 1664525 +% 1013904223;
+            }
+            return v;
+        }
+    };
+
+    { // Baseline
+        const warp_divergence_baseline = gpu.kernels.get("warp_divergence_baseline").?;
+        // warmup
+        try check(cuda.cudaLaunchKernelExC(&config, warp_divergence_baseline, &params));
+
+        try check(cuda.cudaEventRecord(start, null));
+        for (0..sampleSize) |_| {
+            try check(cuda.cudaLaunchKernelExC(&config, warp_divergence_baseline, &params));
+        }
+        try check(cuda.cudaEventRecord(end, null));
+        try check(cuda.cudaDeviceSynchronize());
+
+        try devOut.copyToHost(out);
+
+        for (0..out.len) |i| {
+            const expected = if (i % 2 == 0) f.work_a(in[i]) else f.work_b(in[i]);
+            if (expected != out[i]) {
+                std.debug.print("Index {} of {} mismatch: {} != {}\n", .{i, out.len, expected, out[i]});
+                return error.ValuesDontMatch;
+            }
+        }
+
+        var timeTaken: f32 = undefined;
+        try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+        timeTaken = timeTaken / sampleSize;
+
+        // Compute bandwidth (the 2 * is for one read and one write)
+        const bandwidth = calculate_bandwidth(2 * n * @sizeOf(f32), timeTaken);
+        std.debug.print("wrap_divergence_baseline took {} ms ({} GB/s)\n", .{timeTaken, bandwidth});
+    }
+
+    // Clear output for next kernel
+    try devOut.memset(0x0F);
+
+    { // Fixed
+        const warp_divergence_fixed = gpu.kernels.get("warp_divergence_fixed").?;
+        // warmup
+        try check(cuda.cudaLaunchKernelExC(&config, warp_divergence_fixed, &params));
+
+        try check(cuda.cudaEventRecord(start, null));
+        for (0..sampleSize) |_| {
+            try check(cuda.cudaLaunchKernelExC(&config, warp_divergence_fixed, &params));
+        }
+        try check(cuda.cudaEventRecord(end, null));
+        try check(cuda.cudaDeviceSynchronize());
+
+        try devOut.copyToHost(out);
+
+        for (0..out.len) |i| {
+            const expected = if (i % 2 == 0) f.work_a(in[i]) else f.work_b(in[i]);
+            if (expected != out[i]) {
+                std.debug.print("Index {} of {} mismatch: {} != {}\n", .{i, out.len, expected, out[i]});
+                return error.ValuesDontMatch;
+            }
+        }
+
+        var timeTaken: f32 = undefined;
+        try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+        timeTaken = timeTaken / sampleSize;
+
+        // Compute bandwidth (the 2 * is for one read and one write)
+        const bandwidth = calculate_bandwidth(2 * n * @sizeOf(u32), timeTaken);
+        std.debug.print("wrap_divergence_fixed took {} ms ({} GB/s)\n", .{timeTaken, bandwidth});
+    }
+}
