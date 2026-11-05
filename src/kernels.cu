@@ -69,7 +69,7 @@ extern "C" __global__ void warp_divergence_baseline(const uint32_t* __restrict__
     }
 }
 
-extern "C" __global__ void warp_divergence_fixed(const __restrict__ uint32_t* in, __restrict__ uint32_t* out, const unsigned length) {
+extern "C" __global__ void warp_divergence_fixed(const uint32_t* __restrict__ in, uint32_t* __restrict__ out, const unsigned length) {
     // Wraps 0 does the first 128 even number, wrap 1 does 128 odd number
     // Wrap 2 does the next 128 even number, wrap 3 does the next 128 even numbers etc.
     // That means that there is no warp divergence.
@@ -79,5 +79,29 @@ extern "C" __global__ void warp_divergence_fixed(const __restrict__ uint32_t* in
 
     if (i < length) {
         out[i] = (i % 2 == 0) ? work_a(in[i]) : work_b(in[i]);
+    }
+}
+
+#define FULL_MASK 0xFFFFFFFF
+extern "C" __global__ void warp_vote_a(const int* __restrict__ input, const unsigned length, const int threshold, int* __restrict__ result) {
+    const int stride = blockDim.x * gridDim.x;
+    for (int i = blockIdx.x*blockDim.x; i < length; i += stride) {
+        int index = i + threadIdx.x;
+        unsigned mask = __ballot_sync(FULL_MASK, index < length && input[index] > threshold);
+        int leader = __ffs(mask) - 1;
+        if (leader == threadIdx.x % warpSize) {
+            int count = __popc(mask);
+            atomicAdd(result, count);
+        }
+    }
+}
+
+extern "C" __global__ void warp_vote_b(const int* __restrict__ input, const unsigned length, int* __restrict__ output, const unsigned outputLength, const int threshold) {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    unsigned mask = __ballot_sync(FULL_MASK, i < length && input[i] > threshold);
+    int outputIndex = i / warpSize;
+    if (threadIdx.x % warpSize == 0 && outputIndex < outputLength) {
+        int first = __ffs(mask) - 1; // if not found _ffs returns 0 so the results is -1
+        output[outputIndex] = first < 0 ? first : first + i;
     }
 }

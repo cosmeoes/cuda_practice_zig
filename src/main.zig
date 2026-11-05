@@ -146,7 +146,9 @@ pub fn main(init: std.process.Init) !void {
     // try explicit_mem_example(io, &gpu, 1024);
     // try saxpy_grid_stride_problem(io, &gpu);
     // try matadd_problem(io, &gpu);
-    try warp_divergence_problem(io, &gpu);
+    // try warp_divergence_problem(io, &gpu);
+    try warp_vote_problem_a(io, &gpu);
+    try warp_vote_problem_b(io, &gpu);
 }
 
 fn check(r: cuda.cudaError_t) !void {
@@ -678,3 +680,172 @@ pub fn warp_divergence_problem(io: std.Io, gpu: *GPU) !void {
         std.debug.print("wrap_divergence_fixed took {} ms ({} GB/s)\n", .{timeTaken, bandwidth});
     }
 }
+
+// The input is n = 10,000,019 ints in [0, 999], with threshold thr = 990.
+// A. Count the elements where data[i] > thr. Use a grid-stride loop over a fixed small grid, and do one atomic per warp per iteration,
+// not one per thread. Watch out: every lane in the ballot mask has to reach the __ballot_sync. 
+// A naive grid-stride loop lets some lanes leave early on the last iteration.
+pub fn warp_vote_problem_a(io: std.Io, gpu: *GPU) !void {
+    var hostArena = std.heap.ArenaAllocator.init(gpu.host_allocator.allocator());
+    defer _ = hostArena.deinit();
+    var hostAlloc = hostArena.allocator();
+
+    var n: u32 = 10_000_019;
+    var threshold: i32 = 990;
+
+    const input = try hostAlloc.alloc(i32, n);
+
+    var prng = std.Random.DefaultPrng.init(@intCast(std.Io.Clock.real.now(io).toMicroseconds()));
+    const random = prng.random();
+    var expectedResult: u32 = 0;
+    for (input) |*x| {
+        x.* = random.intRangeLessThan(i32, 0, 1_000);
+        if (x.* > threshold) {
+            expectedResult += 1;
+        }
+    }
+
+    var devInput = try gpu.malloc(i32, n);
+    var devResult = try gpu.malloc(i32, 1);
+    try devResult.memset(0);
+
+    try devInput.copyFromHost(input);
+
+    // Timing events
+    const sampleSize = 20;
+    var start: cuda.cudaEvent_t = undefined;
+    var end: cuda.cudaEvent_t = undefined;
+    try check(cuda.cudaEventCreate(&start));
+    defer _ = cuda.cudaEventDestroy(start);
+    try check(cuda.cudaEventCreate(&end));
+    defer _ = cuda.cudaEventDestroy(end);
+
+    var params = [_]?*anyopaque{@ptrCast(&devInput.ptr), &n, &threshold, @ptrCast(&devResult.ptr)};
+    var config: cuda.cudaLaunchConfig_t  = .{
+        .gridDim = dim3(100, 1, 1),
+        .blockDim = dim3(256, 1, 1),
+    };
+
+    const warp_vote_a = gpu.kernels.get("warp_vote_a").?;
+    // warmup
+    try check(cuda.cudaLaunchKernelExC(&config, warp_vote_a, &params));
+
+    try check(cuda.cudaEventRecord(start, null));
+    for (0..sampleSize) |_| {
+        try devResult.memset(0);
+        try check(cuda.cudaLaunchKernelExC(&config, warp_vote_a, &params));
+    }
+    try check(cuda.cudaEventRecord(end, null));
+    try check(cuda.cudaDeviceSynchronize());
+
+    var result: i32 = 0;
+    try check(cuda.cudaMemcpy(&result, devResult.ptr, @sizeOf(i32), cuda.cudaMemcpyDeviceToHost));
+
+    if (expectedResult != result) {
+        std.debug.print("Result doesn't match with expected result. Expected {}. Got {}\n", .{expectedResult, result});
+    }
+
+    var timeTaken: f32 = undefined;
+    try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+    timeTaken = timeTaken / sampleSize;
+    const bandwidth = calculate_bandwidth(n * @sizeOf(u32), timeTaken);
+    std.debug.print("warp_vote took {} ms ({} GB/s) \n", .{timeTaken, bandwidth});
+}
+// Continuation of prev problem:
+// B. First match per chunk: split the data into chunks of 32 elements. For each chunk, output the global index of the first element > thr, 
+// or -1 if there isn't one. Use one thread per element, so one warp handles one chunk.
+pub fn warp_vote_problem_b(io: std.Io, gpu: *GPU) !void {
+    var hostArena = std.heap.ArenaAllocator.init(gpu.host_allocator.allocator());
+    defer _ = hostArena.deinit();
+    var hostAlloc = hostArena.allocator();
+
+    var n: u32 = 10_000_019;
+    var groupCount: u32 = @divCeil(n, 32);
+    var threshold: i32 = 990;
+
+    const input = try hostAlloc.alloc(i32, n);
+    const output = try hostAlloc.alloc(i32, groupCount);
+    const expected = try hostAlloc.alloc(i32, groupCount);
+    @memset(output, 0);
+    @memset(expected, 0);
+
+    const seed: u64 = @intCast(std.Io.Clock.real.now(io).toMicroseconds());
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    for (input) |*x| {
+        x.* = random.intRangeLessThan(i32, 0, 1_000);
+    }
+
+    { // Calculate results in cpu to verify GPU result
+        var i: usize = 0;
+        while (i < input.len) : (i += 32) {
+            var chunkResult: i32 = -1;
+            for (i..i+32) |j| {
+                if (j < input.len and input[j] > threshold) {
+                    chunkResult = @intCast(j);
+                    break;
+                }
+            }
+            expected[@divFloor(i, 32)] = chunkResult;
+        }
+    }
+
+    var devInput = try gpu.malloc(i32, n);
+    var devOutput = try gpu.malloc(i32, groupCount);
+
+    try devInput.copyFromHost(input);
+
+    // Timing events
+    const sampleSize = 20;
+    var start: cuda.cudaEvent_t = undefined;
+    var end: cuda.cudaEvent_t = undefined;
+    try check(cuda.cudaEventCreate(&start));
+    defer _ = cuda.cudaEventDestroy(start);
+    try check(cuda.cudaEventCreate(&end));
+    defer _ = cuda.cudaEventDestroy(end);
+
+    var params = [_]?*anyopaque{@ptrCast(&devInput.ptr), &n, @ptrCast(&devOutput.ptr), &groupCount, &threshold};
+    const threads = 256;
+    var config: cuda.cudaLaunchConfig_t  = .{
+        .gridDim = dim3(@divCeil(n, threads), 1, 1),
+        .blockDim = dim3(256, 1, 1),
+    };
+
+    const warp_vote_b = gpu.kernels.get("warp_vote_b").?;
+    // warmup
+    try check(cuda.cudaLaunchKernelExC(&config, warp_vote_b, &params));
+
+    try check(cuda.cudaEventRecord(start, null));
+    for (0..sampleSize) |_| {
+        try check(cuda.cudaLaunchKernelExC(&config, warp_vote_b, &params));
+    }
+    try check(cuda.cudaEventRecord(end, null));
+    try check(cuda.cudaDeviceSynchronize());
+
+    try devOutput.copyToHost(output);
+
+    // Verify correctness
+    for (0..output.len) |i| {
+        if (expected[i] != output[i]) {
+            std.debug.print("Index {} mismatch: {} != {}\n", .{i, expected[i], output[i]});
+            return error.ValueDoesntMatch;
+        }
+    }
+
+    var timeTaken: f32 = undefined;
+    try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+    timeTaken = timeTaken / sampleSize;
+    const bandwidth = calculate_bandwidth(n * @sizeOf(i32) + output.len * @sizeOf(i32), timeTaken);
+    std.debug.print("warp_vote took {} ms ({} GB/s) \n", .{timeTaken, bandwidth});
+}
+
+// Sum n = 2^25 + 3 floats in [0, 1]. Each block should:
+// accumulate per-thread partial sums with a grid-stride loop,
+// reduce them in __shared__ memory with a tree using sequential addressing (s = BLOCK/2 … 1, sdata[tid] += sdata[tid+s]),
+// atomicAdd its result into a single global float.
+// Check against a CPU sum done in double, with a relative tolerance of 1e-4.
+// Stretch: write the "interleaved addressing" version (tid % (2*s) == 0) and measure it against yours. Then make the result deterministic by replacing the atomic with a second pass over per-block partials.
+pub fn shared_memory_tree_reductions() !void {
+
+}
+
