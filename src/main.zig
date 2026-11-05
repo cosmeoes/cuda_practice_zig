@@ -147,8 +147,9 @@ pub fn main(init: std.process.Init) !void {
     // try saxpy_grid_stride_problem(io, &gpu);
     // try matadd_problem(io, &gpu);
     // try warp_divergence_problem(io, &gpu);
-    try warp_vote_problem_a(io, &gpu);
-    try warp_vote_problem_b(io, &gpu);
+    // try warp_vote_problem_a(io, &gpu);
+    // try warp_vote_problem_b(io, &gpu);
+    try shared_memory_tree_reductions_problem(io, &gpu);
 }
 
 fn check(r: cuda.cudaError_t) !void {
@@ -179,8 +180,8 @@ fn calculate_bandwidth(bytes: usize, ms: f32) f32 {
 }
 
 fn init_array(random: std.Random,  a: []f32) void {
-    for (a) |*x| {
-        x.* = random.float(f32);
+    for (0..a.len) |i| {
+        a[i] = random.float(f32);
     }
 }
 
@@ -706,7 +707,9 @@ pub fn warp_vote_problem_a(io: std.Io, gpu: *GPU) !void {
     }
 
     var devInput = try gpu.malloc(i32, n);
+    defer gpu.free(devInput.ptr);
     var devResult = try gpu.malloc(i32, 1);
+    defer gpu.free(devResult.ptr);
     try devResult.memset(0);
 
     try devInput.copyFromHost(input);
@@ -791,7 +794,9 @@ pub fn warp_vote_problem_b(io: std.Io, gpu: *GPU) !void {
     }
 
     var devInput = try gpu.malloc(i32, n);
+    defer gpu.free(devInput.ptr);
     var devOutput = try gpu.malloc(i32, groupCount);
+    defer gpu.free(devOutput.ptr);
 
     try devInput.copyFromHost(input);
 
@@ -840,12 +845,146 @@ pub fn warp_vote_problem_b(io: std.Io, gpu: *GPU) !void {
 }
 
 // Sum n = 2^25 + 3 floats in [0, 1]. Each block should:
-// accumulate per-thread partial sums with a grid-stride loop,
-// reduce them in __shared__ memory with a tree using sequential addressing (s = BLOCK/2 … 1, sdata[tid] += sdata[tid+s]),
-// atomicAdd its result into a single global float.
+// 1. accumulate per-thread partial sums with a grid-stride loop,
+// 2. reduce them in __shared__ memory with a tree using sequential addressing (s = BLOCK/2 … 1, sdata[tid] += sdata[tid+s]),
+// 3. atomicAdd its result into a single global float.
 // Check against a CPU sum done in double, with a relative tolerance of 1e-4.
-// Stretch: write the "interleaved addressing" version (tid % (2*s) == 0) and measure it against yours. Then make the result deterministic by replacing the atomic with a second pass over per-block partials.
-pub fn shared_memory_tree_reductions() !void {
+// Stretch: write the "interleaved addressing" version (tid % (2*s) == 0) and measure it against yours.
+// Then make the result deterministic by replacing the atomic with a second pass over per-block partials.
+pub fn shared_memory_tree_reductions_problem(io: std.Io, gpu: *GPU) !void {
+    var hostArena = std.heap.ArenaAllocator.init(gpu.host_allocator.allocator());
+    defer _ = hostArena.deinit();
+    var hostAlloc = hostArena.allocator();
 
+    var n = std.math.pow(u32, 2, 25);
+
+    const input = try hostAlloc.alloc(f32, n);
+
+    const seed = 0;
+    // const seed: u64 = @intCast(std.Io.Clock.real.now(io).toMicroseconds());
+    _ = io;
+    var prng = std.Random.DefaultPrng.init(seed);
+    // This generates numbers in [0, 1). But I think that's good enough for this exercise
+    init_array(prng.random(), input);
+
+    // Generate expected results
+    var expected: f64 = 0; // instructions specify a double for cpu sum
+    for (input) |i| {
+        expected += @floatCast(i);
+    }
+
+    var devInput = try gpu.malloc(f32, n);
+    defer gpu.free(devInput.ptr);
+    var devOut: *f32 = @ptrCast((try gpu.malloc(f32, 1)).ptr);
+    defer gpu.free(devOut);
+    try check(cuda.cudaMemset(devOut, 0, @sizeOf(f32)));
+
+    try devInput.copyFromHost(input);
+
+    // Timing events
+    const sampleSize = 20;
+    var start: cuda.cudaEvent_t = undefined;
+    var end: cuda.cudaEvent_t = undefined;
+    try check(cuda.cudaEventCreate(&start));
+    defer _ = cuda.cudaEventDestroy(start);
+    try check(cuda.cudaEventCreate(&end));
+    defer _ = cuda.cudaEventDestroy(end);
+
+    var params = [_]?*anyopaque{@ptrCast(&devInput.ptr), &n, @ptrCast(&devOut)};
+    const threads = 256;
+    var config: cuda.cudaLaunchConfig_t = .{
+        .gridDim = dim3(@divCeil(n, threads), 1, 1),
+        .blockDim = dim3(threads, 1, 1),
+    };
+
+    {
+        const shared_memory_tree_reduction = gpu.kernels.get("shared_memory_tree_reductions").?;
+        // warm up
+        try check(cuda.cudaLaunchKernelExC(&config, shared_memory_tree_reduction, &params));
+
+        try check(cuda.cudaEventRecord(start, null));
+        for (0..sampleSize) |_| {
+            try check(cuda.cudaMemset(devOut, 0, @sizeOf(f32)));
+            try check(cuda.cudaLaunchKernelExC(&config, shared_memory_tree_reduction, &params));
+        }
+        try check(cuda.cudaEventRecord(end, null));
+        try check(cuda.cudaDeviceSynchronize());
+
+        var out: f32 = 0.0;
+        try check(cuda.cudaMemcpy(&out, devOut, @sizeOf(f32), cuda.cudaMemcpyDeviceToHost));
+
+        // Verify correctness
+        if (!std.math.approxEqRel(f64, expected, @floatCast(out), 1e-4)) {
+            std.debug.print("Result doesn't match with expected result. Expected {}. Got {}\n", .{expected, out});
+        } 
+
+        var timeTaken: f32 = undefined;
+        try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+        timeTaken = timeTaken / sampleSize;
+        const bandwidth = calculate_bandwidth(n * @sizeOf(f32), timeTaken); 
+        std.debug.print("shared_memory_tree_reductions (sequential) took {} ms ({} GB/s) \n", .{timeTaken, bandwidth});
+    }
+    {
+        // This version is slower because of higher wrap divergence
+        const shared_memory_tree_reduction_interleaved = gpu.kernels.get("shared_memory_tree_reductions_interleaved").?;
+        // warm up
+        try check(cuda.cudaLaunchKernelExC(&config, shared_memory_tree_reduction_interleaved, &params));
+
+        try check(cuda.cudaEventRecord(start, null));
+        for (0..sampleSize) |_| {
+            try check(cuda.cudaMemset(devOut, 0, @sizeOf(f32)));
+            try check(cuda.cudaLaunchKernelExC(&config, shared_memory_tree_reduction_interleaved, &params));
+        }
+        try check(cuda.cudaEventRecord(end, null));
+        try check(cuda.cudaDeviceSynchronize());
+
+        var out: f32 = 0.0;
+        try check(cuda.cudaMemcpy(&out, devOut, @sizeOf(f32), cuda.cudaMemcpyDeviceToHost));
+
+        // Verify correctness
+        if (!std.math.approxEqRel(f64, expected, @floatCast(out), 1e-4)) {
+            std.debug.print("Result doesn't match with expected result. Expected {}. Got {}\n", .{expected, out});
+        }
+
+        var timeTaken: f32 = undefined;
+        try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+        timeTaken = timeTaken / sampleSize;
+        const bandwidth = calculate_bandwidth(n * @sizeOf(f32), timeTaken); 
+        std.debug.print("shared_memory_tree_reductions (interleaved) took {} ms ({} GB/s) \n", .{timeTaken, bandwidth});
+    }
+    { // using two passes to make it deterministic
+        var devPartials = try gpu.malloc(f32, config.gridDim.x); // one partial per block
+        defer gpu.free(devPartials.ptr);
+
+        const first_pass = gpu.kernels.get("shared_memory_tree_reductions_deterministic_fp").?;
+        var firstPassParameters = [_]?*anyopaque{@ptrCast(&devInput.ptr), &n, @ptrCast(&devPartials.ptr)};
+        const second_pass = gpu.kernels.get("shared_memory_tree_reductions_deterministic_sp").?;
+        var len: u32 = @intCast(devPartials.len);
+        var secondPassParameters = [_]?*anyopaque{@ptrCast(&devPartials.ptr), &len};
+
+        try check(cuda.cudaEventRecord(start, null));
+        for (0..sampleSize) |_| {
+            try check(cuda.cudaLaunchKernelExC(&config, first_pass, &firstPassParameters));
+            try check(cuda.cudaLaunchKernelExC(&.{ 
+                .gridDim = dim3(1, 1, 1), .blockDim = config.blockDim ,
+            }, second_pass, &secondPassParameters));
+        }
+        try check(cuda.cudaEventRecord(end, null));
+        try check(cuda.cudaDeviceSynchronize());
+
+        var out: f32 = 0.0;
+        try check(cuda.cudaMemcpy(&out, devPartials.ptr, @sizeOf(f32), cuda.cudaMemcpyDeviceToHost));
+
+        // Verify correctness
+        if (!std.math.approxEqRel(f64, expected, @floatCast(out), 1e-4)) {
+            std.debug.print("Result doesn't match with expected result. Expected {}. Got {}\n", .{expected, out});
+        } 
+
+        var timeTaken: f32 = undefined;
+        try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+        timeTaken = timeTaken / sampleSize;
+        const bandwidth = calculate_bandwidth(n * @sizeOf(f32) + devPartials.len * @sizeOf(f32), timeTaken); 
+        std.debug.print("shared_memory_tree_reductions (deterministic) took {} ms ({} GB/s) \n", .{timeTaken, bandwidth});
+    }
 }
 

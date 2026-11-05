@@ -105,3 +105,69 @@ extern "C" __global__ void warp_vote_b(const int* __restrict__ input, const unsi
         output[outputIndex] = first < 0 ? first : first + i;
     }
 }
+
+#define THREADS_PER_BLOCK 256
+__device__ float tree_reduce(const float* __restrict__ input, const unsigned length) {
+    __shared__ float shared_memory_array[THREADS_PER_BLOCK];
+    const int stride = blockDim.x * gridDim.x;
+
+    float sum = 0;
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < length; i += stride) {
+        sum += input[i];
+    }
+
+    shared_memory_array[threadIdx.x] = sum;
+
+    for (int s = blockDim.x/2; s >= 1; s /= 2) {
+        __syncthreads(); // make sure everybody wrote their sum
+        if (threadIdx.x < s) {
+            shared_memory_array[threadIdx.x] += shared_memory_array[threadIdx.x + s];
+        }
+    }
+
+    __syncthreads(); // make sure everybody wrote their sum
+    return shared_memory_array[0];
+}
+
+// Write restult with an atomicAdd
+extern "C" __global__ void shared_memory_tree_reductions(const float* __restrict__ input, const unsigned length, float* __restrict__ output) {
+    float sum = tree_reduce(input, length);
+    if (threadIdx.x == 0) atomicAdd(output, sum);
+}
+
+// Write restult with a second pas over per thread block partials
+// This is the first pass that stores per block results into partials array
+extern "C" __global__ void shared_memory_tree_reductions_deterministic_fp(const float* __restrict__ input, const unsigned length, float* __restrict__ partials) {
+    float sum = tree_reduce(input, length);
+    // Assumes blocksDim.x <= partialsLen
+    if (threadIdx.x == 0) partials[blockIdx.x] = sum;
+}
+
+// This is the second pass that sums partials and stores the results into the first element of the partials array
+// Assumes only one block per partials[0..length]
+extern "C" __global__ void shared_memory_tree_reductions_deterministic_sp(float* __restrict__ partials, const unsigned length) {
+    float sum = tree_reduce(partials, length);
+    if (threadIdx.x == 0) partials[0] = sum; 
+}
+
+extern "C" __global__ void shared_memory_tree_reductions_interleaved(const float* __restrict__ input, const unsigned length, float* __restrict__ output) {
+    __shared__ float shared_memory_array[THREADS_PER_BLOCK];
+    const int stride = blockDim.x * gridDim.x;
+
+    float sum = 0;
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < length; i += stride) {
+        sum += input[i];
+    }
+
+    shared_memory_array[threadIdx.x] = sum;
+
+    for (int s = 1; s < blockDim.x; s *= 2) {
+        __syncthreads(); // make sure everybody wrote their sum
+        if (threadIdx.x % (2*s) == 0) {
+            shared_memory_array[threadIdx.x] += shared_memory_array[threadIdx.x + s];
+        }
+    }
+
+    __syncthreads(); // make sure everybody wrote their sum
+    if (threadIdx.x == 0) atomicAdd(output, shared_memory_array[threadIdx.x]);
+}
