@@ -171,3 +171,112 @@ extern "C" __global__ void shared_memory_tree_reductions_interleaved(const float
     __syncthreads(); // make sure everybody wrote their sum
     if (threadIdx.x == 0) atomicAdd(output, shared_memory_array[threadIdx.x]);
 }
+
+__device__ float wrap_reduce_sum(float v) {
+    for (int i = warpSize/2; i > 0; i /= 2) {
+        v += __shfl_down_sync(FULL_MASK, v, i);
+    }
+
+    return v;
+}
+
+__device__ float block_reduce_sum(float v) {
+    __shared__ float warp_sums[32];
+    const int lane = threadIdx.x % warpSize;
+    const int warpIndex = threadIdx.x >> 5; // divide by 32
+    const int warpCount = blockDim.x >> 5;
+
+    v = wrap_reduce_sum(v);
+    if (lane == 0) warp_sums[warpIndex] = v;
+
+    __syncthreads();
+
+    float sum;
+    if (warpIndex == 0) {
+        sum = lane < warpCount ? warp_sums[lane] : 0.0f;
+        for (int i = warpSize/2; i > 0; i /= 2) {
+            sum += __shfl_xor_sync(FULL_MASK, sum, i);
+            // sum += __shfl_down_sync(FULL_MASK, sum, i); // butterfly reduce version
+        }
+    }
+
+    return sum;
+}
+
+extern "C" void __global__ shuffle_reduction(const float* __restrict__ input, const unsigned length, float* __restrict__ output) {
+    const int stride = blockDim.x * gridDim.x;
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < length; i += stride) {
+        sum += input[i];
+    }
+
+    sum = block_reduce_sum(sum);
+
+    if (threadIdx.x == 0) atomicAdd(output, sum);
+}
+
+extern "C" void __global__ histogram_a(const unsigned char* __restrict__ input, const unsigned inputLen, unsigned* __restrict__ bins) {
+    int stride = blockDim.x*gridDim.x;
+    for (int i = threadIdx.x + blockIdx.x*blockDim.x; i < inputLen; i += stride) {
+        atomicAdd(&bins[input[i]], 1u);
+    }
+}
+
+extern "C" void __global__ histogram_b(const unsigned char* __restrict__ input, const unsigned inputLen, unsigned* __restrict__ bins) {
+    __shared__ unsigned smem[256];
+
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        smem[i] = 0;
+    }
+    __syncthreads();
+
+    int stride = blockDim.x*gridDim.x;
+    for (int i = threadIdx.x + blockIdx.x*blockDim.x; i < inputLen; i += stride) {
+        atomicAdd(&smem[input[i]], 1u);
+    }
+
+    __syncthreads();
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        if (smem[i] != 0) {
+            atomicAdd(&bins[i], smem[i]);
+        }
+    }
+}
+
+extern "C" void __global__ histogram_c(const unsigned char* __restrict__ input, const unsigned inputLen, unsigned* __restrict__ bins) {
+    extern __shared__ unsigned dynsmem[];
+    // cast dynamic shared memory to 2d array
+    const int cols = 256;
+    unsigned (*smem)[cols] = (unsigned (*)[cols]) dynsmem;
+
+    const int warpIndex = threadIdx.x >> 5;
+    const int lane = threadIdx.x % 32;
+
+    for (int i = lane; i < 256; i += 32) {
+        smem[warpIndex][i] = 0;
+    }
+    __syncwarp();
+
+    int stride = blockDim.x*gridDim.x;
+    int n4 = inputLen/4;
+    const uchar4* input4 = (uchar4*) input;
+    for (int i = threadIdx.x + blockIdx.x*blockDim.x; i < n4; i += stride) {
+        uchar4 value = input4[i];
+        atomicAdd(&smem[warpIndex][value.x], 1u);
+        atomicAdd(&smem[warpIndex][value.y], 1u);
+        atomicAdd(&smem[warpIndex][value.z], 1u);
+        atomicAdd(&smem[warpIndex][value.w], 1u);
+    }
+
+    for (int i = n4*4 + threadIdx.x + blockIdx.x*blockDim.x; i < inputLen; i += stride) {
+        atomicAdd(&smem[warpIndex][input[i]], 1u);
+    }
+
+    __syncwarp();
+    for (int i = lane; i < 256; i += 32) {
+        if (smem[warpIndex][i] != 0) {
+            atomicAdd(&bins[i], smem[warpIndex][i]);
+        }
+    }
+}

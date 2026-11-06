@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Build kernel ptx
-    const nvcc_compile = b.addSystemCommand(&.{"nvcc", "-ptx", "-lineinfo", "-arch=native", "src/kernels.cu", "-o"});
+    const nvcc_compile = b.addSystemCommand(&.{"nvcc", "--Werror",  "all-warnings",  "-ptx", "-lineinfo", "-arch=native", "src/kernels.cu", "-o"});
     nvcc_compile.addFileInput(b.path("src/kernels.cu"));
     const nvcc_output = nvcc_compile.addOutputFileArg2("kernels.ptx", .{});
 

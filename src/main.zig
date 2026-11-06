@@ -41,6 +41,12 @@ const GPU = struct {
         return .init(ptr, size);
     }
 
+    pub fn create(_: GPU, comptime T: type) !*T {
+        var ptr: *T = undefined;
+        try check(cuda.cudaMalloc(@ptrCast(&ptr), @sizeOf(T)));
+        return ptr;
+    }
+
     pub fn mallocManaged(_: GPU, comptime T: type, size: usize) ![]T {
         var ptr: [*]T = undefined;
         try check(cuda.cudaMallocManaged(@ptrCast(&ptr), size*@sizeOf(f32), cuda.cudaMemAttachGlobal));
@@ -149,7 +155,9 @@ pub fn main(init: std.process.Init) !void {
     // try warp_divergence_problem(io, &gpu);
     // try warp_vote_problem_a(io, &gpu);
     // try warp_vote_problem_b(io, &gpu);
-    try shared_memory_tree_reductions_problem(io, &gpu);
+    // try shared_memory_tree_reductions_problem(io, &gpu);
+    // try shuffle_reduction_problem(io, &gpu);
+    try histogram_problem(io, &gpu);
 }
 
 fn check(r: cuda.cudaError_t) !void {
@@ -746,6 +754,7 @@ pub fn warp_vote_problem_a(io: std.Io, gpu: *GPU) !void {
 
     if (expectedResult != result) {
         std.debug.print("Result doesn't match with expected result. Expected {}. Got {}\n", .{expectedResult, result});
+        return error.UnexpectedResult;
     }
 
     var timeTaken: f32 = undefined;
@@ -988,3 +997,242 @@ pub fn shared_memory_tree_reductions_problem(io: std.Io, gpu: *GPU) !void {
     }
 }
 
+// Same problem as 05, but with no shared-memory tree. Implement:
+// - float warp_reduce_sum(float v) using __shfl_down_sync (5 steps).
+// - float block_reduce_sum(float v): each warp reduces, lane 0 writes to __shared__ float[32], sync,
+// then warp 0 reduces those values. It must work for any blockDim.x that's a multiple of 32, up to 1024.
+// - the kernel, which runs a grid-stride loop, then a block reduce, then one atomicAdd per block.
+// Test with block sizes 64, 256 and 1024.
+// Stretch: a butterfly version with __shfl_xor_sync where every lane ends up holding the sum.
+pub fn shuffle_reduction_problem(io: std.Io,  gpu: *GPU) !void {
+    var hostArena = std.heap.ArenaAllocator.init(gpu.host_allocator.allocator());
+    defer _ = hostArena.deinit();
+    var hostAlloc = hostArena.allocator();
+
+    var n = std.math.pow(u32, 2, 25);
+
+    const input = try hostAlloc.alloc(f32, n);
+
+    const seed = 0;
+    // const seed: u64 = @intCast(std.Io.Clock.real.now(io).toMicroseconds());
+    _ = io;
+    var prng = std.Random.DefaultPrng.init(seed);
+    // This generates numbers in [0, 1). But I think that's good enough for this exercise
+    init_array(prng.random(), input);
+
+    // Generate expected results
+    var expected: f64 = 0; // instructions specify a double for cpu sum
+    for (input) |i| {
+        expected += @floatCast(i);
+    }
+
+    var devInput = try gpu.malloc(f32, n);
+    defer gpu.free(devInput.ptr);
+    var devOut: *f32 = try gpu.create(f32);
+    defer gpu.free(devOut);
+    try check(cuda.cudaMemset(devOut, 0, @sizeOf(f32)));
+
+    try devInput.copyFromHost(input);
+
+    // Timing events
+    const sampleSize = 20;
+    var start: cuda.cudaEvent_t = undefined;
+    var end: cuda.cudaEvent_t = undefined;
+    try check(cuda.cudaEventCreate(&start));
+    defer _ = cuda.cudaEventDestroy(start);
+    try check(cuda.cudaEventCreate(&end));
+    defer _ = cuda.cudaEventDestroy(end);
+
+    var params = [_]?*anyopaque{@ptrCast(&devInput.ptr), &n, @ptrCast(&devOut)};
+    var deviceProperties: cuda.cudaDeviceProp = undefined;
+    try check(cuda.cudaGetDeviceProperties(&deviceProperties, gpu.device));
+    const smCount: u32 = @intCast(deviceProperties.multiProcessorCount);
+    var config: cuda.cudaLaunchConfig_t = .{
+        .gridDim = dim3(4*smCount, 1, 1),
+        .blockDim = dim3(256, 1, 1),
+    };
+
+    {
+        const shuffle_reduction = gpu.kernels.get("shuffle_reduction").?;
+        // warm up
+        try check(cuda.cudaLaunchKernelExC(&config, shuffle_reduction, &params));
+
+        const threadSizes: []const u32 = &.{64, 256, 1024};
+        for (threadSizes) |threads| {
+            config.blockDim.x = threads;
+            try check(cuda.cudaEventRecord(start, null));
+            for (0..sampleSize) |_| {
+                try check(cuda.cudaMemset(devOut, 0, @sizeOf(f32)));
+                try check(cuda.cudaLaunchKernelExC(&config, shuffle_reduction, &params));
+            }
+            try check(cuda.cudaEventRecord(end, null));
+            try check(cuda.cudaDeviceSynchronize());
+
+            var out: f32 = 0.0;
+            try check(cuda.cudaMemcpy(&out, devOut, @sizeOf(f32), cuda.cudaMemcpyDeviceToHost));
+
+            // Verify correctness
+            if (!std.math.approxEqRel(f64, expected, @floatCast(out), 1e-4)) {
+                std.debug.print("Result doesn't match with expected result. Expected {}. Got {}\n", .{expected, out});
+                return error.UnexpectedResult;
+            }
+
+            var timeTaken: f32 = undefined;
+            try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+            timeTaken = timeTaken / sampleSize;
+            const bandwidth = calculate_bandwidth(n * @sizeOf(f32), timeTaken); 
+            std.debug.print("tree_reduce_with_no_sm_tree ({} threads) took {} ms ({} GB/s) \n", .{threads, timeTaken, bandwidth});
+        }
+    }
+}
+
+// Build a 256-bin histogram of n = 2^26 + 11 bytes. The input is skewed: 75% of the bytes fall
+// into just 6 values, which creates heavy atomic contention.
+// A. Use global atomicAdd per element.
+// B. Privatize: give each block a __shared__ histogram. Zero it cooperatively, update it with 
+// shared atomics, then merge the non-zero bins into global memory. It must work when 
+// blockDim.x ≠ 256.
+// Measure: A against B.
+// Stretch: load 4 bytes at a time. Then give each warp its own sub-histogram.
+// 
+fn histogram_problem(io: std.Io, gpu: *GPU) !void {
+    var hostArena = std.heap.ArenaAllocator.init(gpu.host_allocator.allocator());
+    defer _ = hostArena.deinit();
+    var hostAlloc = hostArena.allocator();
+
+    var n = std.math.pow(u32, 2, 26) + 11;
+    const binCount = 256;
+
+    const input = try hostAlloc.alloc(u8, n);
+    const bins = try hostAlloc.alloc(u32, binCount);
+    const expected = try hostAlloc.alloc(u32, binCount);
+    @memset(expected, 0);
+
+    const seed = 0;
+    _ = io;
+    // const seed: u64 = @intCast(std.Io.Clock.real.now(io).toMicroseconds());
+    var prng = std.Random.DefaultPrng.init(seed);
+    for(0..input.len) |i| {
+        // Bias so 75% fall bellow 6
+        if (prng.random().float(f32) < 0.75) {
+            input[i] = prng.random().uintLessThan(u8, 6);
+        } else {
+            input[i] = prng.random().uintLessThan(u8, 250) + 6;
+        }
+        expected[input[i]] += 1;
+    }
+
+    var devInput = try gpu.malloc(u8, n);
+    defer gpu.free(devInput.ptr);
+    var devBins = try gpu.malloc(u32, binCount);
+    defer gpu.free(devBins.ptr);
+    try devBins.memset(0);
+
+    try devInput.copyFromHost(input);
+
+    // Timing events
+    const sampleSize = 20;
+    var start: cuda.cudaEvent_t = undefined;
+    var end: cuda.cudaEvent_t = undefined;
+    try check(cuda.cudaEventCreate(&start));
+    defer _ = cuda.cudaEventDestroy(start);
+    try check(cuda.cudaEventCreate(&end));
+    defer _ = cuda.cudaEventDestroy(end);
+
+    var params = [_]?*anyopaque{@ptrCast(&devInput.ptr), &n, @ptrCast(&devBins.ptr)};
+    var deviceProperties: cuda.cudaDeviceProp = undefined;
+    try check(cuda.cudaGetDeviceProperties(&deviceProperties, gpu.device));
+    const smCount: u32 = @intCast(deviceProperties.multiProcessorCount);
+    var config: cuda.cudaLaunchConfig_t = .{
+        .gridDim = dim3(4 * smCount, 1, 1),
+        .blockDim = dim3(256, 1, 1), 
+    };
+
+    {
+        const histogram_a = gpu.kernels.get("histogram_a").?;
+        // warm up
+        try check(cuda.cudaLaunchKernelExC(&config, histogram_a, &params));
+
+        try check(cuda.cudaEventRecord(start, null));
+        for (0..sampleSize) |_| {
+            try devBins.memset(0);
+            try check(cuda.cudaLaunchKernelExC(&config, histogram_a, &params));
+        }
+        try check(cuda.cudaEventRecord(end, null));
+        try check(cuda.cudaDeviceSynchronize());
+
+        try devBins.copyToHost(bins);
+
+        for (0..bins.len) |i| {
+            if (expected[i] != bins[i]) {
+                std.debug.print("Index {} mismatch: {} != {}\n", .{i, expected[i], bins[i]});
+                return error.ValueDoesntMatch;
+            }
+        }
+
+        var timeTaken: f32 = undefined;
+        try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+        timeTaken = timeTaken / sampleSize;
+        const bandwidth = calculate_bandwidth(n * @sizeOf(u8) + binCount * @sizeOf(u32), timeTaken);
+        std.debug.print("histogram_a took {} ms ({} GB/s) \n", .{timeTaken, bandwidth});
+    }
+    { // Waaaay faster
+        const histogram_b = gpu.kernels.get("histogram_b").?;
+        // warm up
+        try check(cuda.cudaLaunchKernelExC(&config, histogram_b, &params));
+
+        try check(cuda.cudaEventRecord(start, null));
+        for (0..sampleSize) |_| {
+            try devBins.memset(0);
+            try check(cuda.cudaLaunchKernelExC(&config, histogram_b, &params));
+        }
+        try check(cuda.cudaEventRecord(end, null));
+        try check(cuda.cudaDeviceSynchronize());
+
+        try devBins.copyToHost(bins);
+
+        for (0..bins.len) |i| {
+            if (expected[i] != bins[i]) {
+                std.debug.print("Index {} mismatch: {} != {}\n", .{i, expected[i], bins[i]});
+                return error.ValueDoesntMatch;
+            }
+        }
+
+        var timeTaken: f32 = undefined;
+        try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+        timeTaken = timeTaken / sampleSize;
+        const bandwidth = calculate_bandwidth(n * @sizeOf(u8) + binCount * @sizeOf(u32), timeTaken);
+        std.debug.print("histogram_b took {} ms ({} GB/s) \n", .{timeTaken, bandwidth});
+    }
+    {
+        const histogram_c = gpu.kernels.get("histogram_c").?;
+        // Block dim x must be a multiple of 32 for this kernel
+        assert(config.blockDim.x % 32 == 0);
+        config.dynamicSmemBytes = @divFloor(config.blockDim.x, 32) * 256 * @sizeOf(u32);
+        // warm up
+        try check(cuda.cudaLaunchKernelExC(&config, histogram_c, &params));
+
+        try check(cuda.cudaEventRecord(start, null));
+        for (0..sampleSize) |_| {
+            try devBins.memset(0);
+            try check(cuda.cudaLaunchKernelExC(&config, histogram_c, &params));
+        }
+        try check(cuda.cudaEventRecord(end, null));
+        try check(cuda.cudaDeviceSynchronize());
+
+        try devBins.copyToHost(bins);
+
+        for (0..bins.len) |i| {
+            if (expected[i] != bins[i]) {
+                std.debug.print("Index {} mismatch: {} != {}\n", .{i, expected[i], bins[i]});
+                return error.ValueDoesntMatch;
+            }
+        }
+
+        var timeTaken: f32 = undefined;
+        try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+        timeTaken = timeTaken / sampleSize;
+        const bandwidth = calculate_bandwidth(n * @sizeOf(u8) + binCount * @sizeOf(u32), timeTaken);
+        std.debug.print("histogram_c took {} ms ({} GB/s) \n", .{timeTaken, bandwidth});
+    }
+}
