@@ -280,3 +280,52 @@ extern "C" void __global__ histogram_c(const unsigned char* __restrict__ input, 
         }
     }
 }
+
+extern "C" void __global__ matrix_transpose_naive(const float* __restrict__ input, float* __restrict__ output, const unsigned rows, const unsigned cols) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < rows*cols) {
+        int row = i / cols;
+        int col = i % cols;
+        output[col*rows + row] = input[i];
+    }
+}
+
+extern "C" void __global__ matrix_transpose_tiled(const float* __restrict__ input, float* __restrict__ output, const unsigned rows, const unsigned cols) {
+    __shared__ float smem[32][33];
+    int row = threadIdx.y + blockIdx.y * blockDim.y;
+    int col = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (row < rows && col < cols) {
+        smem[threadIdx.y][threadIdx.x] = input[row*cols + col];
+    }
+
+    __syncthreads();
+
+    row = threadIdx.x + blockIdx.y * blockDim.y;
+    col = threadIdx.y + blockIdx.x * blockDim.x;
+    if (row < rows && col < cols) {
+        output[col*rows + row] = smem[threadIdx.x][threadIdx.y];
+    }
+}
+
+extern "C" void __global__ matrix_transpose_32x8(const float* __restrict__ input, float* __restrict__ output, const unsigned rows, const unsigned cols) {
+    __shared__ float smem[32][33];
+    int row = threadIdx.y + blockIdx.y * 32;
+    int col = threadIdx.x + blockIdx.x * 32;
+
+    for (int i = 0; i < 32; i += 8) {
+        if (row + i < rows && col < cols) {
+            smem[threadIdx.y + i][threadIdx.x] = input[(row + i)*cols + col];
+        }
+    }
+
+    __syncthreads();
+
+    row = threadIdx.x + blockIdx.y * 32;
+    col = threadIdx.y + blockIdx.x * 32;
+    for (int i = 0; i < 32; i += 8) {
+        if (row < rows && col + i < cols) {
+            output[(col + i)*rows + row] = smem[threadIdx.x][threadIdx.y + i];
+        }
+    }
+}

@@ -157,7 +157,8 @@ pub fn main(init: std.process.Init) !void {
     // try warp_vote_problem_b(io, &gpu);
     // try shared_memory_tree_reductions_problem(io, &gpu);
     // try shuffle_reduction_problem(io, &gpu);
-    try histogram_problem(io, &gpu);
+    // try histogram_problem(io, &gpu);
+    try matrix_transpose_problem(io, &gpu);
 }
 
 fn check(r: cuda.cudaError_t) !void {
@@ -1234,5 +1235,155 @@ fn histogram_problem(io: std.Io, gpu: *GPU) !void {
         timeTaken = timeTaken / sampleSize;
         const bandwidth = calculate_bandwidth(n * @sizeOf(u8) + binCount * @sizeOf(u32), timeTaken);
         std.debug.print("histogram_c took {} ms ({} GB/s) \n", .{timeTaken, bandwidth});
+    }
+}
+
+//Transpose a row-major 3001 × 4099 float matrix in (rows × cols) into out (cols × rows).
+//Naive: one thread per element, with coalesced reads and strided writes.
+//Tiled: use 32 × 32 tiles and blocks of (32, 8), so each thread moves 4 elements. Read a tile coalesced into __shared__ memory, sync, then write it out coalesced. Pad the shared tile to avoid bank conflicts.
+//Reference: write a plain copy kernel with the same access pattern as a reads-only "speed of light" baseline.
+//Measure: all three. Then remove the padding and measure again.
+fn matrix_transpose_problem(io: std.Io, gpu: *GPU) !void {
+    var hostArena = std.heap.ArenaAllocator.init(gpu.host_allocator.allocator());
+    defer _ = hostArena.deinit();
+    var hostAlloc = hostArena.allocator();
+
+    var rows: u32 = 3001;
+    var cols: u32 = 4099;
+    const size = rows*cols;
+
+    const input = try hostAlloc.alloc(f32, size);
+    const output = try hostAlloc.alloc(f32, size);
+    const expected = try hostAlloc.alloc(f32, size);
+    const seed = 0;
+    _ = io;
+    // const seed: u64 = @intCast(std.Io.Clock.real.now(io).toMicroseconds());
+    var prng = std.Random.DefaultPrng.init(seed);
+    init_array(prng.random(), input);
+
+    // Generate expected results
+    for (0..input.len) |i| {
+        const row = @divFloor(i, cols);
+        const col = i % cols;
+        expected[col*rows + row] = input[i];
+    }
+
+    const deviceBuffer = try gpu.malloc(f32, size*2);
+    defer gpu.free(deviceBuffer.ptr);
+    var devInput = deviceBuffer.sub(0, size);
+    var devOutput = deviceBuffer.sub(size, deviceBuffer.len);
+
+    try devInput.copyFromHost(input);
+
+    // Timing events
+    const sampleSize = 1;
+    var start: cuda.cudaEvent_t = undefined;
+    var end: cuda.cudaEvent_t = undefined;
+    try check(cuda.cudaEventCreate(&start));
+    defer _ = cuda.cudaEventDestroy(start);
+    try check(cuda.cudaEventCreate(&end));
+    defer _ = cuda.cudaEventDestroy(end);
+
+    var params = [_]?*anyopaque{@ptrCast(&devInput.ptr), @ptrCast(&devOutput.ptr), &rows, &cols};
+
+    {
+        var config: cuda.cudaLaunchConfig_t  = .{
+            .gridDim = dim3(@divCeil(size, 256), 1, 1),
+            .blockDim = dim3(256, 1, 1),
+        };
+        const matrix_transpose_naive = gpu.kernels.get("matrix_transpose_naive").?;
+        // warm up
+        try check(cuda.cudaLaunchKernelExC(&config, matrix_transpose_naive, &params));
+
+        try check(cuda.cudaEventRecord(start, null));
+        for (0..sampleSize) |_| {
+            try check(cuda.cudaLaunchKernelExC(&config, matrix_transpose_naive, &params));
+        }
+        try check(cuda.cudaEventRecord(end, null));
+        try check(cuda.cudaDeviceSynchronize());
+
+        try devOutput.copyToHost(output);
+
+        // Verify results
+        for (0..output.len) |i| {
+            if (expected[i] != output[i]) {
+                std.debug.print("Index {} mismatch: {} != {}\n", .{i, expected[i], output[i]});
+                return error.ValuesDontMatch;
+            }
+        }
+
+        var timeTaken: f32 = undefined;
+        try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+        timeTaken /= @floatFromInt(sampleSize);
+        // Compute bandwidth (the 2 is for one read and one write)
+        const bandwidth = calculate_bandwidth(2 * size * @sizeOf(f32), timeTaken);
+        std.debug.print("matrix_transpose_naive {} ms ({} GB/s)\n", .{timeTaken, bandwidth});
+    }
+    try devOutput.memset(0x00); // reset
+    {
+        var config: cuda.cudaLaunchConfig_t  =  .{};
+        config.blockDim = dim3(32, 32, 1);
+        config.gridDim = dim3(@divCeil(cols, config.blockDim.x), @divCeil(rows, config.blockDim.y), 1);
+        const matrix_transpose_tiled = gpu.kernels.get("matrix_transpose_tiled").?;
+        // warm up
+        try check(cuda.cudaLaunchKernelExC(&config, matrix_transpose_tiled, &params));
+
+        try check(cuda.cudaEventRecord(start, null));
+        for (0..sampleSize) |_| {
+            try check(cuda.cudaLaunchKernelExC(&config, matrix_transpose_tiled, &params));
+        }
+        try check(cuda.cudaEventRecord(end, null));
+        try check(cuda.cudaDeviceSynchronize());
+
+        try devOutput.copyToHost(output);
+
+        // Verify results
+        for (0..output.len) |i| {
+            if (expected[i] != output[i]) {
+                std.debug.print("Index {} mismatch: {} != {}\n", .{i, expected[i], output[i]});
+                return error.ValuesDontMatch;
+            }
+        }
+
+        var timeTaken: f32 = undefined;
+        try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+        timeTaken /= @floatFromInt(sampleSize);
+        // Compute bandwidth (the 2 is for one read and one write)
+        const bandwidth = calculate_bandwidth(2 * size * @sizeOf(f32), timeTaken);
+        std.debug.print("matrix_transpose_tiled {} ms ({} GB/s)\n", .{timeTaken, bandwidth});
+    }
+    try devOutput.memset(0x00); // reset
+    { // 32, 8
+        var config: cuda.cudaLaunchConfig_t = .{};
+        const tileSize = 32;
+        config.blockDim = dim3(tileSize, 8, 1);
+        config.gridDim = dim3(@divCeil(cols,tileSize), @divCeil(rows, tileSize), 1);
+        const matrix_transpose_tiled_32x8 = gpu.kernels.get("matrix_transpose_32x8").?;
+        // warm up
+        try check(cuda.cudaLaunchKernelExC(&config, matrix_transpose_tiled_32x8, &params));
+
+        try check(cuda.cudaEventRecord(start, null));
+        for (0..sampleSize) |_| {
+            try check(cuda.cudaLaunchKernelExC(&config, matrix_transpose_tiled_32x8, &params));
+        }
+        try check(cuda.cudaEventRecord(end, null));
+        try check(cuda.cudaDeviceSynchronize());
+
+        try devOutput.copyToHost(output);
+
+        // Verify results
+        for (0..output.len) |i| {
+            if (expected[i] != output[i]) {
+                std.debug.print("Index {} mismatch: {} != {}\n", .{i, expected[i], output[i]});
+                return error.ValuesDontMatch;
+            }
+        }
+
+        var timeTaken: f32 = undefined;
+        try check(cuda.cudaEventElapsedTime(&timeTaken, start, end));
+        timeTaken /= @floatFromInt(sampleSize);
+        // Compute bandwidth (the 2 is for one read and one write)
+        const bandwidth = calculate_bandwidth(2 * size * @sizeOf(f32), timeTaken);
+        std.debug.print("matrix_transpose_32x8 {} ms ({} GB/s)\n", .{timeTaken, bandwidth});
     }
 }
